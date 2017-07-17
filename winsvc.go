@@ -3,6 +3,7 @@
 package winsvc
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 	"syscall"
@@ -64,8 +65,6 @@ func (m *Mgr) serviceDescription(s *mgr.Service) (string, error) {
 	return toString(p.Description), nil
 }
 
-func isAccessDenied(err error) bool { return err == syscall.ERROR_ACCESS_DENIED }
-
 func (m *Mgr) services() ([]*mgr.Service, error) {
 	names, err := m.m.ListServices()
 	if err != nil {
@@ -116,24 +115,367 @@ func (m *Mgr) iter(fn func(*mgr.Service) error) (first error) {
 	return
 }
 
+func (m *Mgr) setStartType(s *mgr.Service, startType uint32) error {
+	conf, err := s.Config()
+	if err != nil {
+		return fmt.Errorf("winsvc: querying config for service (%s): %s",
+			s.Name, err)
+	}
+	if conf.StartType == startType {
+		return nil
+	}
+	conf.StartType = startType
+	if err := s.UpdateConfig(conf); err != nil {
+		return fmt.Errorf("winsvc: setting start type of service (%s) to (%s): %s",
+			s.Name, svcStartTypeString(startType), err)
+	}
+	return nil
+}
+
 // https://msdn.microsoft.com/en-us/library/windows/desktop/ms681383(v=vs.85).aspx
 const ERROR_SERVICE_ALREADY_RUNNING = syscall.Errno(0x420)
 
+func (m *Mgr) doStart(s *mgr.Service) error {
+	if err := m.setStartType(s, mgr.StartManual); err != nil {
+		return err
+	}
+
+	status, err := s.Query()
+	if err != nil {
+		return fmt.Errorf("winsvc: querying status of service (%s): %s", s.Name, err)
+	}
+
+	// Check if the service is already running
+	if status.State != svc.Stopped && status.State != svc.StopPending {
+		return nil
+	}
+
+	start := time.Now()
+	oldCheckpoint := status.CheckPoint
+
+	for status.State == svc.StopPending {
+		// Do not wait longer than the wait hint. A good interval is
+		// one-tenth of the wait hint but not less than 1 second
+		// and not more than 10 seconds.
+		//
+		hint := time.Duration(status.WaitHint) * time.Millisecond
+		if hint < time.Second*10 {
+			hint = time.Second * 10
+		}
+
+		wait := hint / 10
+		switch {
+		case wait < time.Second:
+			wait = time.Second
+		case wait > time.Second*10:
+			wait = time.Second * 10
+		}
+		time.Sleep(wait)
+
+		status, err = s.Query()
+		if err != nil {
+			return fmt.Errorf("winsvc: querying status of service (%s): %s",
+				s.Name, err)
+		}
+
+		switch {
+		case status.CheckPoint > oldCheckpoint:
+			start = time.Now()
+			oldCheckpoint = status.CheckPoint
+		case time.Since(start) > hint:
+			return fmt.Errorf("winsvc: start service: timeout waiting for service to stop: %s", s.Name)
+		}
+	}
+
+	if err := s.Start(); err != nil {
+		// Ignore error if the service is running
+		if err != ERROR_SERVICE_ALREADY_RUNNING {
+			return fmt.Errorf("winsvc: starting service (%s): %s", s.Name, err)
+		}
+	}
+
+	status, err = s.Query()
+	if err != nil {
+		return fmt.Errorf("winsvc: querying status of service (%s): %s", s.Name, err)
+	}
+
+	start = time.Now()
+	oldCheckpoint = status.CheckPoint
+
+	for status.State == svc.StartPending {
+
+		hint := time.Duration(status.WaitHint) * time.Millisecond
+		if hint < time.Second*10 {
+			hint = time.Second * 10
+		}
+
+		wait := hint / 10
+		switch {
+		case wait < time.Second:
+			wait = time.Second
+		case wait > time.Second*10:
+			wait = time.Second * 10
+		}
+		time.Sleep(wait)
+
+		status, err = s.Query()
+		if err != nil {
+			return fmt.Errorf("winsvc: querying status of service (%s): %s",
+				s.Name, err)
+		}
+
+		switch {
+		case status.CheckPoint > oldCheckpoint:
+			start = time.Now()
+			oldCheckpoint = status.CheckPoint
+		case time.Since(start) > hint:
+			// No progress made within the wait hint.
+			break
+		}
+	}
+
+	if status.State != svc.Running {
+		return fmt.Errorf("winsvc: start service: service not started. "+
+			"Name: %s State: %s Checkpoint: %d WaitHint: %d", s.Name,
+			svcStateString(status.State), status.CheckPoint, status.WaitHint)
+	}
+	return nil
+}
+
 func (m *Mgr) Start() (first error) {
-	return m.iter(func(s *mgr.Service) error {
-		if err := m.setStartType(s, mgr.StartManual); err != nil {
-			fmt.Printf("START ERROR - StartType: Service (%s): %s\n", s.Name, err)
+	return m.iter(m.doStart)
+}
+
+func (m *Mgr) doStop(s *mgr.Service) error {
+	const Timeout = time.Second * 30
+
+	if err := m.setStartType(s, mgr.StartDisabled); err != nil {
+		return err
+	}
+
+	status, err := s.Query()
+	if err != nil {
+		return fmt.Errorf("winsvc: querying status of service (%s): %s", s.Name, err)
+	}
+
+	// Check if the service is already stopped
+	if status.State == svc.Stopped {
+		return nil
+	}
+
+	// If a stop is pending, wait for it
+
+	start := time.Now()
+	for status.State == svc.StopPending {
+		// Do not wait longer than the wait hint. A good interval is
+		// one-tenth of the wait hint but not less than 1 second
+		// and not more than 10 seconds.
+		//
+		wait := time.Duration(status.WaitHint) * time.Millisecond / 10
+		switch {
+		case wait < time.Second:
+			wait = time.Second
+		case wait > time.Second*10:
+			wait = time.Second * 10
+		}
+		time.Sleep(wait)
+
+		status, err = s.Query()
+		if err != nil {
+			return fmt.Errorf("winsvc: querying status of service (%s): %s",
+				s.Name, err)
+		}
+
+		if status.State == svc.Stopped {
+			return nil // Exit
+		}
+		if time.Since(start) > Timeout {
+			return fmt.Errorf("winsvc: stop service: timeout waiting for service to stop: %s",
+				s.Name)
+		}
+	}
+
+	// If a start is pending, wait for it
+
+	start = time.Now()
+	oldCheckpoint := status.CheckPoint
+	for status.State == svc.StartPending {
+
+		hint := time.Duration(status.WaitHint) * time.Millisecond
+		if hint < time.Second*10 {
+			hint = time.Second * 10
+		}
+		wait := hint / 10
+		switch {
+		case wait < time.Second:
+			wait = time.Second
+		case wait > time.Second*10:
+			wait = time.Second * 10
+		}
+		time.Sleep(wait)
+
+		status, err = s.Query()
+		if err != nil {
+			return fmt.Errorf("winsvc: querying status of service (%s): %s",
+				s.Name, err)
+		}
+
+		switch {
+		case status.CheckPoint > oldCheckpoint:
+			start = time.Now()
+			oldCheckpoint = status.CheckPoint
+		case time.Since(start) > hint:
+			// No progress made within the wait hint.
+			break
+		}
+	}
+
+	// Stop service
+
+	status, err = s.Control(svc.Stop)
+	if err != nil {
+		return fmt.Errorf("winsvc: stopping service (%s): %s", s.Name, err)
+	}
+
+	var emptyStatus svc.Status
+	if status == emptyStatus {
+		status, err = s.Query()
+		if err != nil {
+			return fmt.Errorf("winsvc: querying status of service (%s): %s",
+				s.Name, err)
+		}
+	}
+
+	start = time.Now()
+	for status.State != svc.Stopped {
+		hint := time.Duration(status.WaitHint) * time.Millisecond
+		if hint < time.Second*10 {
+			hint = time.Second * 10
+		}
+		wait := hint / 10
+		switch {
+		case wait < time.Second:
+			wait = time.Second
+		case wait > time.Second*10:
+			wait = time.Second * 10
+		}
+		time.Sleep(wait)
+
+		status, err = s.Query()
+		if err != nil {
+			return fmt.Errorf("winsvc: querying status of service (%s): %s",
+				s.Name, err)
+		}
+
+		if status.State == svc.Stopped {
+			break
+		}
+		if time.Since(start) > Timeout {
+			return fmt.Errorf("winsvc: stop service: timeout waiting for service to stop: %s",
+				s.Name)
+		}
+	}
+
+	return nil
+}
+
+func (m *Mgr) Stop() (first error) {
+	return m.iter(m.doStop)
+}
+
+func (m *Mgr) Delete() error {
+	const Timeout = time.Second * 30
+
+	err := m.iter(func(s *mgr.Service) error {
+		return s.Delete()
+	})
+	if err != nil {
+		return err
+	}
+	start := time.Now()
+	for {
+		svcs, err := m.services()
+		if err != nil {
 			return err
 		}
-		if err := s.Start(); err != nil {
-			// Ignore error if the service is running
-			if err != ERROR_SERVICE_ALREADY_RUNNING {
-				fmt.Printf("START ERROR - Start: Service (%s): %s\n", s.Name, err)
-				return err
-			}
+		if len(svcs) == 0 {
+			break
 		}
-		return nil
+		for _, s := range svcs {
+			s.Close()
+		}
+		if time.Since(start) > Timeout {
+			return errors.New("winsvc: timeout waiting for services to be deleted")
+		}
+		time.Sleep(time.Millisecond * 500)
+	}
+	return nil
+}
+
+// var windowsSvcStateStr = [...]string{
+// 	windows.SERVICE_STOPPED:          "stopped",          // 1
+// 	windows.SERVICE_START_PENDING:    "starting",         // 2
+// 	windows.SERVICE_STOP_PENDING:     "stop_pending",     // 3
+// 	windows.SERVICE_RUNNING:          "running",          // 4
+// 	windows.SERVICE_CONTINUE_PENDING: "continue_pending", // 5
+// 	windows.SERVICE_PAUSE_PENDING:    "pause_pending",    // 6
+// 	windows.SERVICE_PAUSED:           "paused",           // 7
+// }
+
+type ServiceStatus struct {
+	Name  string
+	State svc.State
+}
+
+func (s *ServiceStatus) StateString() string {
+	return svcStateString(s.State)
+}
+
+func (m *Mgr) Status() ([]ServiceStatus, error) {
+	svcs, err := m.services()
+	if err != nil {
+		return nil, err
+	}
+	defer closeServices(svcs)
+
+	sts := make([]ServiceStatus, len(svcs))
+	for i, s := range svcs {
+		status, err := s.Query()
+		if err != nil {
+			return nil, err
+		}
+		sts[i] = ServiceStatus{Name: s.Name, State: status.State}
+	}
+	return sts, nil
+}
+
+func (m *Mgr) Unmonitor() error {
+	return m.iter(func(s *mgr.Service) error {
+		return m.setStartType(s, mgr.StartDisabled)
 	})
+}
+
+func (m *Mgr) DisableAgentAutoStart() error {
+	const name = "bosh-agent"
+	s, err := m.m.OpenService("bosh-agent")
+	if err != nil {
+		return fmt.Errorf("winsvc: opening service (%s): %s", name, err)
+	}
+	defer s.Close()
+	return m.setStartType(s, mgr.StartDisabled)
+}
+
+func closeServices(svcs []*mgr.Service) (first error) {
+	for _, s := range svcs {
+		if s == nil || s.Handle == windows.InvalidHandle {
+			continue
+		}
+		if err := s.Close(); err != nil && first == nil {
+			first = err
+		}
+		s.Handle = windows.InvalidHandle
+	}
+	return
 }
 
 func svcStateString(s svc.State) string {
@@ -167,234 +509,3 @@ func svcStartTypeString(startType uint32) string {
 	}
 	return fmt.Sprintf("Invalid Service StartType: %d", startType)
 }
-
-const (
-	ERROR_SERVICE_CANNOT_ACCEPT_CTRL = syscall.Errno(0X425)
-	ERROR_SERVICE_NOT_ACTIVE         = syscall.Errno(0X426)
-)
-
-func (m *Mgr) stopPending(s *mgr.Service) error {
-	const Timeout = 15 * time.Second
-	const Interval = 100 * time.Millisecond
-
-	// Loop while the service state is StartPending
-	//
-	var status svc.Status
-	start := time.Now()
-	for {
-		var err error
-		status, err = s.Query()
-		if err != nil {
-			return fmt.Errorf("winsvc: querying status of service (%s): %s",
-				s.Name, err)
-		}
-		if status.State != svc.StartPending {
-			break
-		}
-		if time.Since(start) > Timeout {
-			return fmt.Errorf("winsvc: timed waiting for service (%s) to start",
-				s.Name)
-		}
-		time.Sleep(Interval)
-	}
-
-	switch status.State {
-	case svc.Stopped, svc.StopPending:
-		// Ok, but how is this possible?
-	case svc.StartPending:
-		// This should not happen
-		return fmt.Errorf("winsvc: invalid state for service: %s", s.Name)
-	default:
-		_, err := s.Control(svc.Stop)
-		return err
-	}
-
-	return nil
-}
-
-func (m *Mgr) setStartType(s *mgr.Service, startType uint32) error {
-	conf, err := s.Config()
-	if err != nil {
-		return fmt.Errorf("winsvc: querying config for service (%s): %s",
-			s.Name, err)
-	}
-	if conf.StartType == startType {
-		return nil
-	}
-	conf.StartType = startType
-	if err := s.UpdateConfig(conf); err != nil {
-		return fmt.Errorf("winsvc: setting start type of service (%s) to (%s): %s",
-			s.Name, svcStartTypeString(startType), err)
-	}
-	return nil
-}
-
-func (m *Mgr) stopService(s *mgr.Service) error {
-	// Set start type to disabled
-	if err := m.setStartType(s, mgr.StartDisabled); err != nil {
-		return err
-	}
-
-	// Send stop command
-	if st, err := s.Control(svc.Stop); err != nil {
-		switch err {
-		case ERROR_SERVICE_CANNOT_ACCEPT_CTRL:
-			switch st.State {
-			case svc.Stopped, svc.StopPending:
-				// Ok
-			case svc.StartPending:
-				if err := m.stopPending(s); err != nil {
-					return err
-				}
-			default:
-				return fmt.Errorf("winsvc: service (%s) invalid state (%s) for error: %s",
-					s.Name, svcStateString(st.State), err)
-			}
-		case ERROR_SERVICE_NOT_ACTIVE:
-			// Ignore the service is not running
-		default:
-			return fmt.Errorf("winsvc: stopping service (%s): %s", s.Name, err)
-		}
-	}
-	return nil
-}
-
-func (m *Mgr) Stop() (first error) {
-	return m.iter(func(s *mgr.Service) error {
-		return m.stopService(s)
-	})
-}
-
-func (m *Mgr) Delete() (first error) {
-	svcs, err := m.services()
-	if err != nil {
-		return err
-	}
-	for _, s := range svcs {
-		if err := s.Delete(); err != nil {
-			if first == nil {
-				first = err
-			}
-		}
-	}
-	running := true
-	for running {
-		for _, s := range svcs {
-			if s == nil {
-				continue
-			}
-			st, err := s.Query()
-			if err != nil {
-				if first == nil {
-					first = err
-				}
-				s.Close()
-				s = nil
-				continue
-			}
-			running = running && st.State == svc.Stopped
-			if st.State == svc.Stopped {
-				s.Close()
-				s = nil
-			}
-		}
-	}
-	return
-}
-
-var windowsSvcStateStr = [...]string{
-	windows.SERVICE_STOPPED:          "stopped",          // 1
-	windows.SERVICE_START_PENDING:    "starting",         // 2
-	windows.SERVICE_STOP_PENDING:     "stop_pending",     // 3
-	windows.SERVICE_RUNNING:          "running",          // 4
-	windows.SERVICE_CONTINUE_PENDING: "continue_pending", // 5
-	windows.SERVICE_PAUSE_PENDING:    "pause_pending",    // 6
-	windows.SERVICE_PAUSED:           "paused",           // 7
-}
-
-func (m *Mgr) State() ([]string, error) {
-	var states []string
-	err := m.iter(func(s *mgr.Service) error {
-		q, err := s.Query()
-		if err != nil {
-			return err
-		}
-		i := int(q.State)
-		if 0 < i && i < len(windowsSvcStateStr) {
-			states = append(states, windowsSvcStateStr[i])
-		} else {
-			states = append(states, "Invalid Service State")
-		}
-		return nil
-	})
-	return states, err
-}
-
-/*
-func main() {
-	m, err := Connect()
-	if err != nil {
-		Fatal(err)
-	}
-	defer m.Disconnect()
-
-	names, err := m.m.ListServices()
-	if err != nil {
-		Fatal(err)
-	}
-	for _, name := range names {
-		s, err := m.m.OpenService(name)
-		if err != nil {
-			fmt.Println("Open:", name)
-			continue
-		}
-		c, err := s.Config()
-		s.Close()
-		if err != nil {
-			fmt.Println("Conf:", name)
-			continue
-		}
-		_ = c
-	}
-
-	// m.match = func(s string) bool {
-	// 	// s = strings.ToLower(s)
-	// 	return strings.Contains(s, "Window")
-	// 	// return strings.Contains(s, "window") || strings.Contains(s, "microsoft")
-	// }
-	// start := time.Now()
-	// first := m.iter(func(s *mgr.Service) error {
-	// 	fmt.Println(s.Name)
-	// 	return nil
-	// })
-	// fmt.Println(time.Since(start))
-	// fmt.Println(first)
-}
-*/
-
-/*
-func Fatal(err interface{}) {
-	if err == nil {
-		return
-	}
-	_, file, line, ok := runtime.Caller(1)
-	if ok {
-		file = filepath.Base(file)
-	}
-	switch err.(type) {
-	case error, string, fmt.Stringer:
-		if ok {
-			fmt.Fprintf(os.Stderr, "Error (%s:%d): %s", file, line, err)
-		} else {
-			fmt.Fprintf(os.Stderr, "Error: %s", err)
-		}
-	default:
-		if ok {
-			fmt.Fprintf(os.Stderr, "Error (%s:%d): %#v\n", file, line, err)
-		} else {
-			fmt.Fprintf(os.Stderr, "Error: %#v\n", err)
-		}
-	}
-	os.Exit(1)
-}
-*/
